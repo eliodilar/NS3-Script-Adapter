@@ -14,3 +14,8 @@ Compiled With ./WAF on Cygwin.
 NS-3.15 version.
 
 Only for warned developpers^^
+
+https://www.nsnam.org/
+
+https://www.ifsttar.fr/accueil/
+
