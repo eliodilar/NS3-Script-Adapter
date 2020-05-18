@@ -1,0 +1,884 @@
+/* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*- */
+
+
+#include "ns3/core-module.h"
+#include "ns3/network-module.h"
+#include "ns3/applications-module.h"
+#include "ns3/wifi-module.h"
+#include "ns3/mobility-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/propagation-module.h"
+#include "ns3/YourApplication.h"
+#include <pthread.h>
+#include <vector>
+#include <time.h>
+#include "ns3/YourApplication-overlock-thread.h"
+
+#include "dds/Store.h"
+#include <cstdio>
+
+#include <stdlib.h> 
+
+#define _MAXCARNUMBER 15		// Max véhicule number
+#define _BEGINPORTNUMBER 7		// Beginning serial-port number definition
+#define _FREQUENCYSENDER 0.3	// Execution frequency of data thread and NS3 application thread
+#define _STARTTIME 1.0			// Star server/client
+#define _STOPTIME 50.0			// Stop server/client
+#define _CRTDBG_MAP_ALLOC
+
+using namespace ns3;
+
+const char * TrameNS3VersDDSName = "Ns3SendWifiFrameHeader";	//	Subscription DDS name 
+const char * TrameRTMapsVersDDSName = "NS3ReceiveWifiFrameHeader";	// RTMpas publication DDS name
+std::string _PCAPDIRECTION = "D:/";	// Root recording of PCAP file
+std::string  _PCAPNAME = "YourApplication";	// Name recording of PCAP file
+
+
+
+
+// Client/server application builder class
+class ServerAppsCreator 
+{
+	public:
+
+		//Class constructor
+YourApplication		ServerAppsCreator(double StartTime, double StopTime, double FrequencyFrameSender){
+			StartTimer = StartTime;
+			StopTimer = StopTime;
+			FrequencySender = FrequencyFrameSender;
+		}
+
+		ServerAppsCreator(){
+
+		}
+
+		~ServerAppsCreator(){
+
+		}
+
+		// Client/server application creator
+		void AppsCreator(int PortNumber, Ptr<Node> IdServer, Ptr<Node> IdClient, Ipv4Address IpClient){
+			
+			// Server builder with helper
+			UdpEchoServerHelper echoServer (PortNumber);
+
+			// Server application installation and starting
+			ApplicationContainer serverApps = echoServer.Install (IdClient);		//client
+			serverApps.Start (Seconds (StartTimer));
+			serverApps.Stop (TimeStep (StopTimer));
+	
+			//Client builder with helper
+			UdpEchoClientHelper echoClient (IpClient, PortNumber);
+			echoClient.SetAttribute ("MaxPackets", UintegerValue (2710));
+			echoClient.SetAttribute ("Interval", TimeValue (Seconds (_FREQUENCYSENDER)));		//a modifier le temps de transfert doit ètre adaptatif au nombres de communication clients serveurs
+
+			// Client application installation ans starting
+			clientApps = echoClient.Install (IdServer);
+			clientApps.Start (Seconds (std::ceil (StartTimer)));
+			clientApps.Stop (TimeStep (StopTimer));
+		}
+
+		// PCAP acquisition (Not used)
+		void SetFilL( std::string Frame){
+			//echoClient.SetFill (clientApps.Get(0), Frame);
+		}
+
+	private:
+		double StartTimer;
+		double StopTimer;
+		double FrequencySender;
+		ApplicationContainer clientApps;
+};
+
+// Struct container IP and ident of an NS3 Node
+struct PtrNodes {
+	Ptr<Node> IdNodes;
+	Ipv4Address IPNodes;
+};
+
+
+// Struct passed from main script to data acquisition thread
+struct DataThread{
+	   std::list<PtrNodes> ListClient;
+	   std::list<PtrNodes> ListServer;
+	   std::list<ServerAppsCreator> * CommunicationObjectListe; 
+	   std::vector<UdpEchoClientHelper> EchoClientDyn;
+	   std::vector<Ptr<Node> > addClientServer;
+	   int time;
+	   int64_t carNumber;
+	   int64_t YourApplicationNumberPropagationChannel;
+	   int NetIntBuilder[_MAXCARNUMBER];
+};
+
+// Déclaration du thread data acquisition
+void *ThreadFrame(void *p);
+
+// ???bonne question^^
+bool Init_DDS_RTMAPS_DLL  (const char * DLL_ADD);
+
+//S ize caster of string
+template <typename Input> std::string StringCast (Input input, short Size);
+   DataThread data;
+   PtrNodes ChainPtrNodes;
+   RtmapsWifiFrameHeader DatDDSSend;
+   NS3WifiFrameHeader DatDDSReceive;
+
+   // Not used i think
+   int tmpFlag;
+
+// Multi-op class builder
+class SingletonBridgeNS3 : public ServerAppsCreator 
+{
+	public:
+
+		//Application builder for multi-op
+		void AutoBridgeNetworkSender(std::list<PtrNodes> ListeClient , PtrNodes ClientBridge){
+			ServerAppsCreator * BridgeObject = new ServerAppsCreator(0.2, 1.0, _FREQUENCYSENDER);  
+			std::cout<< "Multi-op Operating!!!"<<std::endl;
+
+			for(std::list<PtrNodes>::iterator tt = ListeClient.begin(); tt != ListeClient.end() ; tt++){
+				if (tt->IdNodes != ClientBridge.IdNodes){
+					BridgeObject->AppsCreator(20000, tt->IdNodes, ClientBridge.IdNodes, ClientBridge.IPNodes);
+				}
+			}
+
+		// Destruct object create 
+		delete BridgeObject;
+		void DesctructInstance();
+		}
+
+		// Pointer Storage for Object SingletonbridgeNS3
+		static SingletonBridgeNS3 * GetInstanceNewBridge(){
+			if ( Instance == NULL ){
+				Instance = new SingletonBridgeNS3;
+				std::cout<< "Create New Bridge "<<std::endl;
+			}
+		return Instance;
+		}
+
+		// Pointeur Delete
+		void DesctructInstance(){
+		if(Instance!=NULL){
+			delete Instance;
+			Instance = NULL;
+			}
+		std::cout<< "Delete Bridge"<<std::endl;
+		}
+
+	private:
+		SingletonBridgeNS3(){
+
+		}
+
+		~SingletonBridgeNS3();
+		static SingletonBridgeNS3 * Instance;
+};
+SingletonBridgeNS3 * SingletonBridgeNS3::Instance = NULL;
+
+
+
+//-----------------------------------------------------------------------------
+int main (int argc, char ** argv)
+{
+
+  std::vector<double>  StartT;
+  std::vector<double>  StopT;
+
+  // List of Server application 
+  std::list<Ptr< Application> > ServerApps;
+  // List of Cleint application 
+  std::list<Ptr< Application> > ClientApps;
+  //Not used maybe
+  std::list<std::string> Wayer;
+
+  std::string serverName = "127.0.0.1";
+  std::string timeName = "time";
+  std::string radarName = "radar-car1-infra1";
+  std::string s;
+
+  bool verbose = true;
+
+  uint16_t serverPort = 4242;
+  int64_t startTime = 0;
+  int PropagNumber = 0;
+
+  std::ostringstream oss;
+
+
+  YourApplication::GetLiveModelInstance()->SetupPropagation (0, 0, radarName.c_str(), serverName.c_str(), serverPort);
+
+  // Return the number of propag channel instanciate in YourApplication
+  YourApplication::GetLiveModelInstance()->GetYourApplicationNumberPropagationChannel (data.vNumberPropagationChannel);
+
+  // Get and test the Network topologie coded in xxx.script of object vWifi.sln 
+  if(YourApplication::GetLiveModelInstance()->GetYourApplicationNetWork ( data.NetIntBuilder)){
+	  std::cout << "GetYourApplicationNetWork() ok. "<< std::endl;
+	  std::cout<<""<<std::endl;
+  }
+  else{
+	 std::cout<<"!!!WARNING!!! - Echec of YourApplication::GetLiveModelInstance()-> GetYourApplicationNetWork()."<<std::endl;
+	 return 0;
+  }
+
+  //Compulsory!!!
+  YourApplication::GetLiveModelInstance()->SetupPropagation (0, 0, radarName.c_str(), serverName.c_str(), serverPort);
+
+
+  CommandLine cmd;
+  cmd.AddValue ("serverName", "IP or alias of host running YourApplication", serverName);
+  cmd.AddValue ("serverPort", "Port of DDS service on host running YourApplication", serverPort);
+  cmd.AddValue ("timeName", "Name of YourApplicationTime isntance", timeName);
+  cmd.AddValue ("radarName", "Name of YourApplicationRadar instance", radarName);
+  cmd.AddValue ("verbose", "Tell echo applications to log if true", verbose);
+  cmd.Parse (argc,argv);
+
+  if (verbose)
+    {
+      LogComponentEnable ("UdpEchoClientApplication", LOG_LEVEL_INFO);
+      LogComponentEnable ("UdpEchoServerApplication", LOG_LEVEL_INFO);
+    }
+
+  // Node counter for antenna present  innetwork topologie
+  for (int Cpt = 0 ; Cpt <= _MAXCARNUMBER; Cpt++){
+	  if (data.NetIntBuilder[Cpt] > 0){
+		  data.carNumber += 1; 
+	  }
+  }
+
+  // Static instance of NS3 nodes 
+  NodeContainer wifiNodes;
+  //Create a data.carNumber nodes
+  wifiNodes.Create (data.carNumber );
+
+  // Storage pointer for Int node ident
+  const void * fff[_MAXCARNUMBER];
+  void * PointerValUnsignedLong;
+
+  // Convert Hexadecimal ID nodes in Unsigned int long ID nodes ( void * - storage)
+  for (int Cpt = 0 ; Cpt < data.carNumber; Cpt++)
+  {
+	  data.addClientServer.push_back(wifiNodes.Get(Cpt));
+	  PointerValUnsignedLong = PeekPointer (wifiNodes.Get(Cpt));
+	  fff[Cpt] = (const void *) PointerValUnsignedLong;
+  }
+
+  if (YourApplication::GetLiveModelInstance()->SetupTime(timeName.c_str(), serverName.c_str(), serverPort)){
+	 std::cout << "SetupTime() ok." << std::endl;
+	 std::cout<<""<<std::endl;
+  }
+  else{
+	  std::cout<<"!!!WARNING!!! - GetLiveModelInstance()->SetupTime() Notok!"<<std::endl;
+	  return 0;
+  }
+
+  if (YourApplication::GetLiveModelInstance()->GetYourApplicationTime (startTime)){
+	 std::cout << "GetYourApplicationTime ok - Start time: " << startTime << "us" << std::endl;
+	 std::cout<<""<<std::endl;
+  }
+  else{
+	 std::cout<<"!!!WARNING!!! - YourApplication::GetLiveModelInstance()->GetYourApplicationTime()."<<std::endl;
+	 return 0;
+  }
+
+  
+  if( startTime == 0){
+	 std::cout<<"!!!WARNING!!! - GetYourApplicationTime Notok, Value = 0!"<<std::endl;
+	 return 0;
+  }
+
+  // Used to know ifnode topologie is client or server( 0 = none; 1 = client, 2 = server, 3 = client and server)
+  for(unsigned int cpt = 0 ;cpt < data.addClientServer.size() ; cpt++)
+  {
+	  std::cout<< "id: "<<data.NetIntBuilder[cpt] <<std::endl;
+	  if (data.NetIntBuilder[cpt]==2 || data.NetIntBuilder[cpt]==3){
+		ChainPtrNodes.IdNodes = data.addClientServer[cpt];
+		ChainPtrNodes.IPNodes = "";
+		data.ListServer.push_back(ChainPtrNodes);
+	 }
+
+	 if (data.NetIntBuilder[cpt]==1 || data.NetIntBuilder[cpt]==3){
+		ChainPtrNodes.IdNodes = data.addClientServer[cpt];
+		ChainPtrNodes.IPNodes = "";
+		data.ListClient.push_back(ChainPtrNodes);
+	 } 
+  }
+
+  int  DynPortNumber = 0;
+
+  // Setup propagation for all client server communication
+  for(std::list<PtrNodes>::iterator it = data.ListServer.begin(); it != data.ListServer.end() ; it++)
+  {
+	   for(std::list<PtrNodes>::iterator tt = data.ListClient.begin(); tt != data.ListClient.end() ; tt++, DynPortNumber ++)
+	   {
+		if ( it->IdNodes != tt->IdNodes){
+			if (!YourApplication::GetLiveModelInstance()->SetupPropagation (PeekPointer (it->IdNodes),
+				PeekPointer (tt->IdNodes), radarName.c_str(), serverName.c_str(), (_BEGINPORTNUMBER + DynPortNumber )))
+			{
+				std::cerr << "Failed to setup propagation for nodes "
+                << PeekPointer (it->IdNodes) << " and "
+                << PeekPointer (tt->IdNodes)
+                << " using YourApplicationRadar instance " << radarName << std::endl;
+				std::cout<<""<<std::endl;
+			}
+			else
+			{
+				std::cout << "Successfully set up propagation for nodes " 
+                << PeekPointer (it->IdNodes) << " and "
+                << PeekPointer (tt->IdNodes)
+                << " using YourApplicationRadar instance " << radarName << std::endl;
+				std::cout<<""<<std::endl;
+				PropagNumber++;
+			}
+		}
+	 }
+  }
+
+  YourApplication::Synchronizer synch;
+  
+  // NS3 propagation channel creator with YourApplication parameters
+  YansWifiChannelHelper channel; //= YansWifiChannelHelper::Default();
+  channel.SetPropagationDelay ("YourApplication::LivePropagationDelayModel");
+  channel.AddPropagationLoss ("YourApplication::LivePropagationLossModel");
+
+
+
+  YansWifiPhyHelper phy = YansWifiPhyHelper::Default ();
+  phy.SetChannel (channel.Create ());
+
+  WifiHelper wifi = WifiHelper::Default ();
+  wifi.SetRemoteStationManager ("ns3::AarfWifiManager");
+
+  // PC mac id
+  NqosWifiMacHelper mac = NqosWifiMacHelper::Default ();
+
+  Ssid ssid = Ssid ("ns-3-ssid");
+  mac.SetType ("ns3::AdhocWifiMac",
+               "Ssid", SsidValue (ssid));
+
+  // Wifidevice container installation
+  NetDeviceContainer wifiDevices;
+  wifiDevices = wifi.Install (phy, mac, wifiNodes);
+
+  // Mobility installer
+  MobilityHelper mobility;
+/*
+  mobility.SetPositionAllocator ("ns3::GridPositionAllocator",
+                                 "MinX", DoubleValue (0.0),
+                                 "MinY", DoubleValue (0.0),
+                                 "DeltaX", DoubleValue (5.0),
+                                 "DeltaY", DoubleValue (10.0),
+                                 "GridWidth", UintegerValue (3),
+                                 "LayoutType", StringValue ("RowFirst"));
+*/
+  mobility.SetMobilityModel ("YourApplication::LiveMobilityModel");
+  mobility.Install (wifiNodes);
+
+
+
+
+  InternetStackHelper stack;
+  stack.Install (wifiNodes);
+
+  // IP configuration and under-network mask
+  Ipv4AddressHelper address;
+  address.SetBase ("10.1.1.0", "255.255.255.0");
+  Ipv4InterfaceContainer wifiInterfaces;
+  wifiInterfaces = address.Assign (wifiDevices);
+
+
+  // Change ARP cache settings of every nodes so that IP adress resolution is
+  // not aborted if there's no propagation when emitting the first packets...
+  for (NodeContainer::Iterator it = wifiNodes.Begin() ;
+       it != wifiNodes.End() ;
+       ++it)
+    {
+      Ptr<ArpL3Protocol> arpProt = (*it)->GetObject<ArpL3Protocol>();
+      if (!arpProt) continue;
+      // List of ARP caches of node is only accessible through NS-3's
+      // attributes system, not through C++ accessors...
+      ObjectPtrContainerValue arpCaches;
+      if (!arpProt->GetAttributeFailSafe ("CacheList", arpCaches)) continue;
+      for (ObjectPtrContainerValue::Iterator it2 = arpCaches.Begin() ;
+           it2 != arpCaches.End() ; ++it2)
+        {
+          Ptr<ArpCache> arpCache = it2->second->GetObject<ArpCache>();
+          if (!arpCache) continue;
+          arpCache->SetDeadTimeout (Seconds(1));
+          // Again, no C++ accessors but bound attribute?!
+          arpCache->SetAttribute ("MaxRetries", UintegerValue (1000));
+        }
+    }
+
+  
+
+	data.time = startTime;
+
+	DynPortNumber = 0;
+
+	// For all server get the Ip and stock it in PtrNodes struct
+	for (std::list<PtrNodes>::iterator it = data.ListServer.begin(); it != data.ListServer.end() ; it++, DynPortNumber++)
+	{
+		it->IPNodes = wifiInterfaces.GetAddress (DynPortNumber);
+	}
+
+	// For all clients get the Ip and stock it in PtrNodes struct
+	for (std::list<PtrNodes>::iterator it = data.ListClient.begin(); it != data.ListClient.end() ; it++, DynPortNumber++)
+	{
+		for (std::list<PtrNodes>::iterator tt = data.ListServer.begin(); tt != data.ListServer.end() ; tt++)
+		{
+
+			if(tt->IdNodes == it->IdNodes){
+				it->IPNodes = tt->IPNodes;
+				 --DynPortNumber;
+			}
+			else{
+				it->IPNodes = wifiInterfaces.GetAddress (DynPortNumber);
+			}
+		}
+	}
+		 
+	
+	DynPortNumber = 0;
+
+	  // Building applications client/servers for all communication Nodes paires
+	  for(std::list<PtrNodes>::iterator it = data.ListServer.begin(); it != data.ListServer.end() ; it++)
+	  {
+		 for(std::list<PtrNodes>::iterator tt = data.ListClient.begin(); tt != data.ListClient.end() ; tt++, DynPortNumber ++)
+		 {
+			ServerAppsCreator * CommunicationObject = new ServerAppsCreator (_STARTTIME + (0.15*DynPortNumber) , _STOPTIME, _FREQUENCYSENDER);
+			CommunicationObject->AppsCreator(_BEGINPORTNUMBER + DynPortNumber, it->IdNodes, tt->IdNodes, tt->IPNodes);
+		 }
+	  }
+
+ 
+   Ipv4GlobalRoutingHelper::PopulateRoutingTables ();
+
+   _PCAPDIRECTION += _PCAPNAME;
+   phy.EnablePcap	( _PCAPDIRECTION ,wifiDevices.Get (1) ,false ,false );	
+
+   // Ns3 nodes ID converter to Livemodel.dll ID
+   YourApplication::GetLiveModelInstance()->TabConverterIDNs3ToYourApplication (fff);
+
+
+  //-------------------------------------------------information console-------------------------------------------------------------
+  char CmdChar;
+  CmdChar = 'o';
+  unsigned int TestCpt = 0;
+  	
+	while (CmdChar != 'r' && CmdChar != 'R'){
+		std::cout<<""<<std::endl;
+		std::cout<<""<<std::endl;
+		std::cout<<"******************************************************************************"<<std::endl;
+		std::cout<<"********************************UNIT TEST BEGIN*******************************"<<std::endl;
+		std::cout<<"******************************************************************************"<<std::endl;
+
+		std::cout<<""<<std::endl;
+		std::cout<<"NODE UNIT TESTER:"<<std::endl;	// Unit test  on NB Ident and IP creator.
+		std::cout<<""<<std::endl;
+
+		std::cout<<"	Wifi antenna  Number: "<<data.carNumber<<std::endl;
+		std::cout<<""<<std::endl;
+
+		for(std::list<PtrNodes>::iterator it = data.ListServer.begin(); it != data.ListServer.end() ; it++, TestCpt++){
+			std::cout<<"	Server List-> |Ident: "<<it->IdNodes<<" |IP Adress: "<<it->IPNodes<<std::endl;
+
+			for(std::list<PtrNodes>::iterator tt = data.ListClient.begin(); tt != data.ListClient.end() ; tt++){
+			
+				if (it->IdNodes == tt->IdNodes){
+					TestCpt--;
+				}
+			}
+		}
+
+		std::cout<<""<<std::endl;
+
+		for(std::list<PtrNodes>::iterator it = data.ListClient.begin(); it != data.ListClient.end() ; it++, TestCpt++){
+			std::cout<<"	Clients List-> |Ident: "<<it->IdNodes<<" |IP Adress: "<<it->IPNodes<<std::endl;
+		}
+
+		std::cout<< ""<<std::endl;
+
+		//Unit test of NB Ident and IP create correspondes to the Number of car given By DDS.
+		if (data.carNumber != TestCpt){
+			std::cout<<"!!!WARNING!!! - Programme Abord - Number of car DDS different of the number of <Ptr<Nodes> > create ( Ident)."<<std::endl;
+			std::cout<<"!!!WARNING!!! - Antenna Number: "<<data.carNumber<<" |ListeClientServer: "<<TestCpt<<std::endl;
+			return 0;
+		}
+		else{
+			std::cout<<"Test result: Node creation Number ok!"<<std::endl;
+		}
+
+		std::cout<<""<<std::endl;
+		std::cout<<""<<std::endl;
+		std::cout<<""<<std::endl;
+		std::cout<<"TEST NETWORK - ARCHITECTURE:"<<std::endl; // Unit test of Network configuration.
+		std::cout<<""<<std::endl;
+
+		// Unit test for correct network topologie implementation
+		std::cout<<"	Network Architecture info: 1 = Server, 2 = Client, 3 = Client/Server  "<<std::endl;
+		std::cout<<""<<std::endl;
+
+		TestCpt = 0;
+		int Adhoc = 0;
+
+		for(std::list<PtrNodes>::iterator it = data.ListServer.begin(); it != data.ListServer.end() ; it++, TestCpt++){
+			std::cout<<"	Server -> |Ident: "<<it->IdNodes<<" |-> Network Builder: "<<data.NetIntBuilder[TestCpt]<<std::endl;
+
+			if (data.NetIntBuilder[TestCpt] == 3){
+				Adhoc++;
+			}
+
+			if (data.NetIntBuilder[TestCpt] != 2 && data.NetIntBuilder[TestCpt] != 3){
+				std::cout<<""<<std::endl;
+				std::cout<<"!!!WARNING!!! - Node network architecture NotOk, server is client: "<< it->IdNodes<<std::endl;
+				return 0;
+			}
+			else{
+				std::cout<<"Test result: Node network architecture ok!"<<std::endl;
+				std::cout<<""<<std::endl;
+			}
+		}
+
+		TestCpt = TestCpt - Adhoc;
+
+		for(std::list<PtrNodes>::iterator it = data.ListClient.begin(); it != data.ListClient.end() ; it++, TestCpt++){
+			std::cout<<"	Client -> |Ident: "<<it->IdNodes<<" |-> Network Builder: "<<data.NetIntBuilder[TestCpt]<<std::endl;
+
+
+			if (data.NetIntBuilder[TestCpt] != 1 && data.NetIntBuilder[TestCpt] != 3){
+				std::cout<<""<<std::endl;
+				std::cout<<"!!!WARNING!!! - Node network architecture NotOk, client is server: "<<it->IdNodes<<std::endl;
+				return 0;
+			}
+			else{
+				std::cout<<"Test result: Node network architecture ok!"<<std::endl;
+				std::cout<<""<<std::endl;
+			}
+		}
+
+		std::cout<<""<<std::endl;
+		std::cout<<""<<std::endl;
+		std::cout<<""<<std::endl;
+
+		// Unit test of Client/server application corresponds to Newtwork architecture.
+		std::cout<<"TEST CLIENT/SERVER INTER-CONNECTION NUMBER:"<<std::endl; 
+		std::cout<<""<<std::endl;
+
+		std::cout<<"	Number of inter-connection Client/server create: "<<PropagNumber<<std::endl;
+
+		int CalculNbCanauxDePropag = 0;
+
+		for(std::list<PtrNodes>::iterator it = data.ListServer.begin(); it != data.ListServer.end() ; it++){
+			for(std::list<PtrNodes>::iterator tt = data.ListClient.begin(); tt != data.ListClient.end() ; tt++){
+				if (it->IdNodes != tt->IdNodes){
+					CalculNbCanauxDePropag +=1;
+				}
+			}
+		}
+
+			if (PropagNumber != CalculNbCanauxDePropag){
+				if (PropagNumber > CalculNbCanauxDePropag){
+					std::cout<<""<<std::endl;
+					std::cout<<"!!!WARNING!!! - There is "<< PropagNumber - CalculNbCanauxDePropag <<" more communication instanciated that expected ."<<std::endl;
+					std::cout<<"!!!WARNING!!! - Inter-connection instanciated expected : "<<data.ListServer.size() + data.ListClient.size() <<std::endl;
+					return 0;
+				}
+				else if (PropagNumber < CalculNbCanauxDePropag){
+					std::cout<<""<<std::endl;
+					std::cout<<"!!!WARNING!!! - There is  "<<  CalculNbCanauxDePropag - PropagNumber <<" less communication instanciated that expected ."<<std::endl;
+					std::cout<<"!!!WARNING!!! - Inter-connection instanciated expected : "<<data.ListServer.size() + data.ListClient.size() <<std::endl;
+					return 0;
+				}
+			}
+			else{
+				std::cout<<"Test result: Number of inter-connection Client/server ok!"<<std::endl;
+				std::cout<<""<<std::endl;
+			}
+
+		std::cout<<""<<std::endl;
+		std::cout<<""<<std::endl;
+		std::cout<<""<<std::endl;
+
+
+		std::cout<<"LENGHT PROPAGATION PATH:"<<std::endl; 
+		std::cout<<""<<std::endl;
+
+		double LPP = 0, LPPG = 0;
+
+		// Gain and Lentgh tester
+		for(std::list<PtrNodes>::iterator it = data.ListServer.begin(); it != data.ListServer.end() ; it++)
+		{
+			 for(std::list<PtrNodes>::iterator tt = data.ListClient.begin(); tt != data.ListClient.end() ; tt++)
+			 {
+					YourApplication::GetLiveModelInstance()->GetPropagationPathLength(LPP, PeekPointer (it->IdNodes), PeekPointer (tt->IdNodes));
+					YourApplication::GetLiveModelInstance()->GetPropagationGain(LPPG, PeekPointer (it->IdNodes), PeekPointer (tt->IdNodes));
+					std::cout<<"	Length propagation path: "<< LPP<<" between "<<it->IdNodes<< " and "<<tt->IdNodes<<std::endl;
+					std::cout<<"	Gain of propagation path: "<<LPPG<<std::endl;
+					std::cout<<""<<std::endl;
+			 }
+		}	
+
+		std::cout<<""<<std::endl;
+		std::cout<<""<<std::endl;
+		std::cout<<""<<std::endl;
+
+		// DDS Publication tester
+		std::cout<<"DDS NS3 TO RTMAPS CREATOR:"<<std::endl; 
+		std::cout<<""<<std::endl;
+
+		if(!YourApplication::GetLiveModelInstance()->InitPubNs3DDS ( TrameNS3VersDDSName , &DatDDSSend )){
+			std::cout<<""<<std::endl;
+			std::cout<<"!!!WARNING!!! - Publication defaut on Data: "<<TrameNS3VersDDSName<<std::endl;
+			std::cout<<""<<std::endl;
+			return 0;
+		}
+		else{
+			std::cout<<""<<std::endl;
+			std::cout<<"Test result: Publication ok on Data: "<<TrameNS3VersDDSName<<std::endl;
+			std::cout<<""<<std::endl;
+		}
+				
+
+
+		std::cout<<""<<std::endl;
+		std::cout<<""<<std::endl;
+		std::cout<<""<<std::endl;
+		std::cout<<"WIRESHARK FILE CREATE:"<<std::endl; // 
+		std::cout<<""<<std::endl;
+		std::cout<<"	Wireshark file Direction: "<<_PCAPDIRECTION<< "1-0.pcap"<<std::endl;
+		std::cout<<""<<std::endl;
+
+		// Loop of starting or stoping app
+		std::cout<<"******************************************************************************"<<std::endl;
+		std::cout<<"********************************UNIT TEST END*********************************"<<std::endl;
+		std::cout<<"******************************************************************************"<<std::endl;
+		std::cout<<""<<std::endl;
+		std::cout<<"Execute Software ? R = RUN(), S = STOP(), Other key = Refresh Network Info "<<std::endl;
+		std::cout<<"______________________________________________________________________________"<<std::endl;
+
+		std::cout<<""<<std::endl;
+		CmdChar= std::getchar();	 
+
+		if(CmdChar == 's' || CmdChar == 'S'){
+			std::cout<<""<<std::endl;
+			std::cout<<"********ABORD SOFTWARE********"<<std::endl;
+			std::cout<<""<<std::endl;
+			return 0;
+		}
+		else if(CmdChar != 's' && CmdChar != 'r' && CmdChar != 'S' && CmdChar != 'R' ){
+			std::cout<<"Unknow commande , Data Looper execute"<<std::endl;
+		}
+	}
+	
+  std::cout<<"********RUN SOFTWARE********"<<std::endl;
+  std::cout<<""<<std::endl;
+  std::cout<<"Loading"<<std::endl;
+ //-------------------------------------------------information console----------------------------------------------------- 
+
+  pthread_t Threadframe;
+  pthread_create (&Threadframe, NULL, ThreadFrame, &data);		
+
+  Simulator::Run (); //Application de simulation NS3(wifi)
+  Simulator::Destroy ();
+
+
+  return 0;
+}
+
+
+
+void *ThreadFrame(void *p)
+	{
+		// Data storage for DDS acquisition
+		int64_t Time;
+		double OutPosition[3];
+		double OutOrientation[3];
+		double OutVelocity[3];
+		double OutAngularVelocity[3];
+		double Gain;
+		double Length;
+		void * PointerValPtr;
+		//---------------End-----------------
+
+		// Void* caster for structure ofDDS acquisition
+		DataThread DaTa = *(DataThread *)p;
+
+		// Data for Multi-op executing
+		std::list<PtrNodes> MultiOpClient;
+		PtrNodes MultiOpClientData;
+		//-------------End--------------
+		
+		// Data for thread timing execution
+		time_t timer;
+		struct tm y2k = {0};
+		double seconds, tester = 0, condition = 0;
+		//----------------End----------------
+
+		// Initialise subscription from RTMaps on DDS
+		if(!YourApplication::GetLiveModelInstance()->InitSubsNs3DDS  ( TrameRTMapsVersDDSName , "127.0.0.1", 4242 )){
+			std::cout<<""<<std::endl;
+			std::cout<<"!!!WARNING!!! - Subscription defaut on Data: "<<TrameNS3VersDDSName<<std::endl;
+			std::cout<<""<<std::endl;
+			return 0;
+		}
+		else{
+			std::cout<<""<<std::endl;
+			std::cout<<"Test result: Subscription ok on Data: "<<TrameNS3VersDDSName<<std::endl;
+			std::cout<<""<<std::endl;
+		}
+
+	// Loop for Data acquisition
+	while(1)	
+	{
+
+
+		//-----------------------------------Gestion du temps d'éxécution du thread-----------------
+		seconds = 0;
+		tester = 0;
+		condition = 0;
+
+		y2k.tm_hour = 0;   y2k.tm_min = 0; y2k.tm_sec = 0;
+		time(&timer);  //time.h
+
+		seconds = difftime(timer,mktime(&y2k));      // récupération du temps en secondes
+
+		while( condition <= 0.3){
+			time(&timer);
+			tester = difftime(timer,mktime(&y2k));
+			condition = tester - seconds;
+		}
+		//----------------------------------------End-----------------------------------------------
+
+			int Count = 0;
+			int cCpt = 0;
+
+
+			// itération de tous les serveurs
+			for (std::list<PtrNodes>::iterator st = DaTa.ListServer.begin(); st != DaTa.ListServer.end() ; st++, Count++){
+
+				// itération de tous les clients
+				for (std::list<PtrNodes>::iterator ct = DaTa.ListClient.begin(); ct != DaTa.ListClient.end() ; ct++){
+
+					if(st->IdNodes != ct->IdNodes){
+						cCpt++;
+
+						// Identifiant packet
+						DatDDSSend.Pk_ID[cCpt] = cCpt;
+	
+						// Nombre de véhicule
+						DatDDSSend.CarNumber = DaTa.carNumber;
+
+						// Temps YourApplication
+						YourApplication::GetLiveModelInstance()->GetYourApplicationTime (Time);
+						DatDDSSend.Timestamp[cCpt] = Time;
+
+						// Identifiant Noeud wifi Emetteur
+						PointerValPtr = PeekPointer (st->IdNodes);
+						DatDDSSend.Sender_ID[cCpt]=(unsigned long)PointerValPtr;
+
+						// Identifiant Noeud wifi Recepteur
+						PointerValPtr = PeekPointer (ct->IdNodes);
+						DatDDSSend.Receiver_ID[cCpt]=(unsigned long)PointerValPtr;
+
+						// Gain
+						YourApplication::GetLiveModelInstance()->GetPropagationGain( Gain, PeekPointer (st->IdNodes), PeekPointer (ct->IdNodes) );
+						DatDDSSend.Gain[cCpt] = Gain;
+
+						// Longeur
+						YourApplication::GetLiveModelInstance()->GetPropagationPathLength(Length, PeekPointer (st->IdNodes), PeekPointer (ct->IdNodes));
+						DatDDSSend.Length[cCpt] = Length;
+
+						// test de la cohérence des valeurs du gain et de la longeur de cannal
+						if (Gain >= 0.0002 && Length >= 0.1){
+
+							// Orientation véhicule
+							YourApplication::GetLiveModelInstance()->GetNodeOrientation(OutOrientation, PeekPointer (ct->IdNodes));
+
+							// Vitesse du véhicule
+							YourApplication::GetLiveModelInstance()->GetNodeVelocity(OutVelocity, PeekPointer (ct->IdNodes));
+
+							// Position du véhicule
+							YourApplication::GetLiveModelInstance()->GetNodePosition(OutPosition, PeekPointer (ct->IdNodes));
+						
+							// Vitesse angulaire
+							YourApplication::GetLiveModelInstance()->GetNodeAngularVelocity(OutAngularVelocity, PeekPointer (ct->IdNodes)); 
+
+							// Test Multi-op as t'il déja été traité.
+							if (MultiOpClient.size()>1){
+								MultiOpClientData.IdNodes = ct->IdNodes;
+								MultiOpClientData.IPNodes = ct->IPNodes;
+								//std::cout<< " Propagation channel default between :"<< st->IdNodes<< " and "<<ct->IdNodes <<std::endl;
+								//SingletonBridgeNS3::GetInstanceNewBridge()->AutoBridgeNetworkSender(MultiOpClient, MultiOpClientData);
+								//std::cout<< " gain :"<< Gain<< " lenght"<<Length <<std::endl;
+								MultiOpClient.clear();
+							}
+						}
+						else{
+
+							for(int Counter=0 ; Counter < 3; Counter++){
+								OutPosition[Counter] = 0;
+								OutVelocity[Counter] = 0;
+								OutOrientation[Counter] = 0;
+								OutAngularVelocity[Counter] = 0;
+							}
+
+							MultiOpClientData.IdNodes = ct->IdNodes;
+							MultiOpClientData.IPNodes = ct->IPNodes;
+							MultiOpClient.push_back(MultiOpClientData);
+
+						}
+						
+						// remplissage du tableau sur une incrémentation de 3 ( x, y , z).
+						for(int Counter=0 ; Counter < 3; Counter++){
+							DatDDSSend.Position[(cCpt*3)+Counter] = OutPosition[Counter];
+							DatDDSSend.Velocity[(cCpt*3)+Counter] = OutVelocity[Counter];
+							DatDDSSend.Rotation[(cCpt*3)+Counter] = OutOrientation[Counter];
+							DatDDSSend.AngularVelocity[(cCpt*3)+Counter] = OutAngularVelocity[Counter];
+						}
+					}
+				}
+			}
+
+		// Push data on DDS to RTMaps
+		YourApplication::GetLiveModelInstance()->PubNs3DDS(&DatDDSSend);
+
+		// Get data from DDS of RTMaps
+		YourApplication::GetLiveModelInstance()->SubsNs3DDS(&DatDDSReceive); 
+		
+		/*
+		std::cout<< "Pk_id4 : "<<DatDDSReceive.Pk_ID[4]<<std::endl;
+		std::cout<< "Timestamp 4: "<<DatDDSReceive.Timestamp[4]<<std::endl;
+		std::cout<< "Car number: "<<DatDDSReceive. CarNumber<<std::endl;
+		std::cout<< "Sender-ID: "<<DatDDSReceive.Sender_ID[4]<<std::endl;
+		std::cout<< "Receiver_ID: "<<DatDDSReceive.Receiver_ID[4]<<std::endl;
+		std::cout<< "Gain: "<<DatDDSReceive.Gain[4]<<std::endl;
+		std::cout<< "Length: "<<DatDDSReceive.Length[4]<<std::endl;
+		std::cout<< "Position: "<<DatDDSReceive.Position[4]<<std::endl;
+		std::cout<< "Velocity: "<<DatDDSReceive.Velocity[4]<<std::endl;
+		std::cout<< "Rotation: "<<DatDDSReceive.Rotation[4]<<std::endl;
+		std::cout<< "AngularVelocity: "<<DatDDSReceive.AngularVelocity[4]<<std::endl;
+		std::cout<< " "<<std::endl;
+		*/
+		}
+
+	pthread_exit(NULL);
+
+	}
+
+
+
+template <typename Input> std::string StringCast (Input input, short Size)
+	{	
+		std::string StringResize;
+		std::ostringstream oss;
+		oss << input;
+		StringResize = oss.str();
+
+		//size fixator for string var
+		StringResize.resize(Size);	
+		return StringResize;
+	}
+
+
+
+
